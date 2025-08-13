@@ -126,3 +126,63 @@ const server = app.listen(PORT, () => {
 server.headersTimeout = 120000;
 server.keepAliveTimeout = 120000;
 server.requestTimeout = 120000;
+
+
+// GET /screenshot?url=...&fullPage=1
+app.get("/screenshot", async (req, res) => {
+  try {
+    const { url, fullPage } = req.query;
+    if (!url || !isHttpUrl(url)) {
+      return res.status(400).json({ error: "Parámetro 'url' inválido" });
+    }
+
+    const browser = await launchBrowser();
+    const page = await browser.newPage();
+    if (typeof preparePage === "function") await preparePage(page);
+
+    // usa domcontentloaded primero para sitios con muchos requests
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    } catch {
+      await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
+    }
+
+    const buffer = await page.screenshot({
+      type: "png",
+      fullPage: String(fullPage) === "1" || String(fullPage).toLowerCase() === "true"
+    });
+
+    await browser.close();
+    res.setHeader("Content-Type", "image/png");
+    res.send(buffer);
+  } catch (err) {
+    console.error("[/screenshot]", err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// (opcional) GET /pdf?url=...
+app.get("/pdf", async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url || !isHttpUrl(url)) return res.status(400).json({ error: "Parámetro 'url' inválido" });
+
+    const browser = await launchBrowser();
+    const page = await browser.newPage();
+    if (typeof preparePage === "function") await preparePage(page);
+
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    const pdf = await page.pdf({
+      printBackground: true,
+      format: "A4",
+      margin: { top: "10mm", right: "10mm", bottom: "10mm", left: "10mm" }
+    });
+
+    await browser.close();
+    res.setHeader("Content-Type", "application/pdf");
+    res.send(pdf);
+  } catch (e) {
+    console.error("[/pdf]", e);
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
