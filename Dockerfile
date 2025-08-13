@@ -4,6 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PUPPETEER_CACHE_DIR=/usr/src/app/.cache/puppeteer
 ENV PUPPETEER_SKIP_DOWNLOAD=false
 
+# Dependencias necesarias para Chrome
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     fonts-liberation \
