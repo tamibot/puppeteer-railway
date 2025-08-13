@@ -15,7 +15,7 @@ function isHttpUrl(url) {
   catch { return false; }
 }
 
-// >>> NUEVO: lanzar con puppeteer-extra + flags + proxy opcional
+// ===== Lanzar Chrome con stealth + proxy opcional =====
 async function launchBrowser() {
   const args = [
     "--no-sandbox",
@@ -23,74 +23,106 @@ async function launchBrowser() {
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--no-zygote",
-    "--single-process",
+    "--single-process"
   ];
   if (process.env.PROXY_URL) args.push(`--proxy-server=${process.env.PROXY_URL}`);
 
   return puppeteerExtra.launch({
-    executablePath: puppeteer.executablePath(), // usa Chrome que baja Puppeteer
+    executablePath: puppeteer.executablePath(),
     headless: true,
     args
   });
 }
 
-// >>> NUEVO: preparar la página con cabeceras/UA/idioma/tiempo
+// ===== Preparación de página (UA, idioma, tz) =====
 async function preparePage(page) {
-  // UA realista
   await page.setUserAgent(
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
   );
   await page.setViewport({ width: 1366, height: 768, deviceScaleFactor: 1 });
-
-  // Idioma + orden de headers "humanos"
   await page.setExtraHTTPHeaders({
-    "accept-language": "es-ES,es;q=0.9,en;q=0.8"
+    "accept-language": "es-ES,es;q=0.9,en;q=0.8",
+    "referer": "https://www.google.com/"
   });
-
-  // Zona horaria local (reduce señales de automatización)
   try { await page.emulateTimezone("America/Lima"); } catch {}
-
-  // (Opcional) bloquear recursos pesados si sólo quieres HTML
-  await page.setRequestInterception(true);
-  page.on("request", (req) => {
-    const type = req.resourceType();
-    if (["image", "media", "font"].includes(type)) return req.abort();
-    req.continue();
-  });
+  // IMPORTANTE: no bloqueamos imágenes/recursos aquí para no romper challenges
 }
 
-// ================= RUTAS =================
+// ===== Navegación robusta con retries y fallbacks =====
+async function getHtmlRobusto(url) {
+  const browser = await launchBrowser();
+  const page = await browser.newPage();
+  await preparePage(page);
 
-// GET /html?url=...
+  // timeouts razonables
+  page.setDefaultNavigationTimeout(45000);
+  page.setDefaultTimeout(20000);
+
+  let lastError;
+  for (const waitUntil of ["networkidle2", "domcontentloaded"]) {
+    for (let intento = 1; intento <= 2; intento++) {
+      try {
+        const resp = await page.goto(url, { waitUntil, timeout: 45000 });
+
+        // si hay challenge tipo "Just a moment..." espera un rato y vuelve a leer
+        await Promise.race([
+          page.waitForFunction(
+            () => !/just a moment|please wait|verifying|checking your browser/i.test(document.body.innerText),
+            { timeout: 12000 }
+          ),
+          page.waitForTimeout(6000)
+        ]).catch(() => {});
+
+        await page.waitForSelector("body", { timeout: 10000 }).catch(() => {});
+        const html = await page.content();
+        await browser.close();
+
+        // si devolvió directamente la página de challenge, forzamos retry
+        if (/just a moment|please wait|checking your browser/i.test(html)) {
+          throw new Error("Anti-bot challenge detectado");
+        }
+
+        // si la respuesta fue 403/503, retry
+        const status = resp?.status?.() ?? 200;
+        if ([403, 429, 503].includes(status)) {
+          throw new Error(`HTTP ${status}`);
+        }
+
+        return html;
+      } catch (e) {
+        lastError = e;
+        // pequeño backoff
+        await new Promise(r => setTimeout(r, 1000 * intento));
+      }
+    }
+  }
+
+  await browser.close().catch(() => {});
+  throw lastError ?? new Error("Fallo al obtener HTML");
+}
+
+// ======= RUTA: HTML completo =======
 app.get("/html", async (req, res) => {
   try {
     const { url } = req.query;
-    if (!url || !isHttpUrl(url)) return res.status(400).json({ error: "Parámetro 'url' inválido" });
-
-    const browser = await launchBrowser();
-    const page = await browser.newPage();
-    await preparePage(page);
-
-    // Estrategia de navegación con fallback
-    let html;
-    try {
-      await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
-    } catch {
-      // Si la red nunca “se queda quieta”, intenta DOMContentLoaded
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    if (!url || !isHttpUrl(url)) {
+      return res.status(400).json({ ok: false, error: "Parámetro 'url' inválido" });
     }
-
-    // Espera mínima a que el framework hidrate (si aplica)
-    await page.waitForSelector("body", { timeout: 10000 }).catch(() => {});
-    html = await page.content();
-
-    await browser.close();
+    const html = await getHtmlRobusto(url);
     res.json({ ok: true, url, html });
   } catch (e) {
-    console.error(e);
+    console.error("[/html]", e);
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// (Tus rutas GET existentes) /scrape, /screenshot, /pdf …
-// Si quieres mantener /scrape GET tal cual, no lo toques.
+// (tus rutas GET /scrape, /screenshot, /pdf pueden quedarse como estaban)
+
+// ====== servidor y timeouts altos ======
+const PORT = process.env.PORT || 3000;
+const server = app.listen(PORT, () => {
+  console.log(`Puppeteer service listening on :${PORT}`);
+});
+server.headersTimeout = 120000;
+server.keepAliveTimeout = 120000;
+server.requestTimeout = 120000;
